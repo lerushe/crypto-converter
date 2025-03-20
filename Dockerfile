@@ -4,12 +4,12 @@ RUN apt-get update
 RUN pip install --no-cache-dir "poetry==1.8.3"
 
 
-COPY poetry.lock pyproject.toml app/
+COPY poetry.lock pyproject.toml src/
 
-WORKDIR /app
+WORKDIR /src
 
 RUN poetry config virtualenvs.create false & poetry install
 
-COPY . /app
+COPY ./app /src
 
 CMD ["python", "app/main.py"]

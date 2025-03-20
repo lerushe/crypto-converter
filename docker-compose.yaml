@@ -8,8 +8,8 @@ services:
     depends_on:
       - redis
     volumes:
-      - .:/app
-    command: poetry run python app/main.py
+      - .:/src
+    command: poetry run python -m app.main
 
   redis:
     image: redis:latest

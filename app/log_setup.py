@@ -1,7 +1,6 @@
 import logging
 import logging.config
 
-
 server_logger = logging.getLogger('crypto_converter')
 
 

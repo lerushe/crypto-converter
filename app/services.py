@@ -1,11 +1,12 @@
 import asyncio
-import datetime
+import time
 from decimal import Decimal
 
-import aiohttp
+import redis.asyncio as redis
 
-from log_setup import server_logger
-from models import ExchangeService, ConversionRequest, ConversionResponse
+from app.clients.factory import ExchangeClientFactory
+from app.log_setup import server_logger
+from app.models import ConversionRequest, ConversionResponse, ExchangeService
 
 
 class ConversionNotFound(Exception):
@@ -14,118 +15,115 @@ class ConversionNotFound(Exception):
 
 class ConverterService:
 
-    def __init__(self):
-        self.binance_url: str = 'https://api.binance.com/api/v3/ticker/price'
-        self.kucoin_url: str = 'https://api.kucoin.com/api/v1/market/orderbook/level1'
-        self.available_conversion_services = [ExchangeService.KUCOIN, ExchangeService.BINANCE]
-        self.intermediary_currencies = ['BTC', 'USDT', 'ETH']
+    def __init__(self, redis_client: redis.Redis, redis_timeout: int, intermediary_currencies: list[str]):
+        self.redis_client = redis_client
+        self.intermediary_currencies = intermediary_currencies
+        self.redis_default_timeout = redis_timeout
+        self.available_conversion_services = ExchangeClientFactory.mapping
+        self.cache_key_template = 'conversion:{currency_from}:{currency_to}'
 
-    async def _request(self, url):
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url) as response:
-                if not response.ok:
-                    # TODO fix logger
-                    server_logger.error(f'Conversion rate is not found, response: {await response.text()}')
-                    return None
-                data = await response.json()
-                return data
-
-    async def fetch_binance_rate(self, currency_from: str, currency_to: str) -> Decimal | None:
-        data = await self._request(f'{self.binance_url}?symbol={currency_from}{currency_to}')
-        server_logger.info(
-            f'Request to Binance was proceeded, currency: {currency_from} - {currency_to}, result: {data}'
-        )
-        if data is None:
-            return None
-        return Decimal(data['price'])
-
-    async def fetch_kucoin_rate(self, currency_from: str, currency_to: str) -> Decimal | None:
-        data = await self._request(f'{self.kucoin_url}?symbol={currency_from}-{currency_to}')
-        server_logger.info(
-            f'Request to KuCoin was proceeded, currency: {currency_from} - {currency_to}, result: {data}'
-        )
-        if data is None:
-            return None
-        if not data['data']:
-            return None
-        return Decimal(data['data']['price'])
-
-    async def fetch_rate_by_service(self, exchange_service: ExchangeService, currency_from: str, currency_to: str):
-        match exchange_service:
-            case ExchangeService.KUCOIN:
-                return await self.fetch_kucoin_rate(currency_from, currency_to)
-            case ExchangeService.BINANCE:
-                return await self.fetch_binance_rate(currency_from, currency_to)
-            case _:
-                raise Exception(f'Provided Exchange service {exchange_service} is not supported')
-
-    async def fetch_rate_by_intermediary_currency(
+    async def _fetch_rate_by_intermediary_currency(
         self, currency_from: str, currency_to: str
     ) -> tuple[Decimal | None, ExchangeService | None]:
-        conversion_services_to_fetch = set(self.available_conversion_services)
+        server_logger.info('Trying to find exchange rate via intermediary currency')
+
+        conversion_services_to_fetch = self.available_conversion_services
         currencies_to_fetch = set(self.intermediary_currencies) - {currency_from, currency_to}
+        if not currencies_to_fetch:
+            server_logger.info('Can not find any intermediary currency')
+            return None, None
+
         for exchange_service in conversion_services_to_fetch:
             for intermediate_currency in currencies_to_fetch:
-                first_rate_request = self.fetch_rate_by_service(
-                    exchange_service, currency_from, intermediate_currency
-                )
-                second_rate_request = self.fetch_rate_by_service(
-                    exchange_service, intermediate_currency, currency_to
-                )
+                client = ExchangeClientFactory.get_client(exchange_service)
+                first_rate_request = client.fetch_rate(currency_from, intermediate_currency)
+                second_rate_request = client.fetch_rate(intermediate_currency, currency_to)
                 first_rate, second_rate = await asyncio.gather(first_rate_request, second_rate_request)
                 if first_rate is not None and second_rate is not None:
                     return first_rate * second_rate, exchange_service
 
         return None, None
 
-    @staticmethod
-    async def make_conversion_response(
-        exchange_service: ExchangeService, currency_from: str, currency_to: str, rate: Decimal, amount: Decimal
-    ):
+    async def _get_cache_rate(
+        self, conversion_request: ConversionRequest
+    ) -> tuple[Decimal | None, ExchangeService | None, int | None]:
+        cache_key = self.cache_key_template.format(
+            currency_from=conversion_request.currency_from, currency_to=conversion_request.currency_to
+        )
+        cached_data = await self.redis_client.hgetall(cache_key)
+        if cached_data:
+            current_time = int(time.time())
+            cache_updated_at = int(cached_data['updated_at'])
+            if current_time - cache_updated_at > conversion_request.cache_max_seconds:
+                return None, None, None
+            server_logger.info(f'Using cached conversion rate: {cached_data}')
+            return Decimal(cached_data['rate']), cached_data['exchange_service'], cache_updated_at
+
+    async def _save_cache_rate(
+        self, exchange_service: ExchangeService, currency_from: str, currency_to: str, rate: Decimal, updated_at: int
+    ) -> None:
+        cache_key = self.cache_key_template.format(currency_from=currency_from, currency_to=currency_to)
+        await self.redis_client.hset(cache_key, mapping={
+            'rate': str(rate),
+            'updated_at': updated_at,
+            'exchange_service': exchange_service
+        })
+        # Add expire timeout just to not have too old data
+        await self.redis_client.expire(cache_key, self.redis_default_timeout)
+
+    async def _prepare_conversion_response(
+        self, exchange_service: ExchangeService, currency_from: str, currency_to: str, rate: Decimal,
+        amount: Decimal, *, cache_updated_at: int | None = None
+    ) -> ConversionResponse:
+        updated_at = int(time.time())
+        if cache_updated_at is None:
+            await self._save_cache_rate(exchange_service, currency_from, currency_to, rate, updated_at)
+
         return ConversionResponse(
             currency_from=currency_from,
             currency_to=currency_to,
             exchange=exchange_service,
             rate=rate,
             result=amount * rate,
-            updated_at=int(datetime.datetime.now().timestamp())
+            updated_at=cache_updated_at or updated_at
         )
 
     async def convert(self, conversion_request: ConversionRequest) -> ConversionResponse:
+        if conversion_request.cache_max_seconds is not None:
+            rate, exchange_service, updated_at = await self._get_cache_rate(conversion_request)
+            if rate is not None:
+                return await self._prepare_conversion_response(
+                    exchange_service, conversion_request.currency_from, conversion_request.currency_to, rate,
+                    conversion_request.amount, cache_updated_at=updated_at
+                )
+
         conversion_services_to_fetch = set(self.available_conversion_services)
         if conversion_request.exchange is not None:
-            rate = await self.fetch_rate_by_service(
-                conversion_request.exchange, conversion_request.currency_from, conversion_request.currency_to
-            )
-            server_logger.info(f'Attempt 1: {rate}')
+            client = ExchangeClientFactory.get_client(conversion_request.exchange)
+            rate = await client.fetch_rate(conversion_request.currency_from, conversion_request.currency_to)
             if rate is not None:
-                return await self.make_conversion_response(
+                return await self._prepare_conversion_response(
                     conversion_request.exchange, conversion_request.currency_from, conversion_request.currency_to, rate,
                     conversion_request.amount
                 )
             conversion_services_to_fetch.remove(conversion_request.exchange)
 
         for exchange_service in conversion_services_to_fetch:
-            rate = await self.fetch_rate_by_service(
-                exchange_service, conversion_request.currency_from, conversion_request.currency_to
-            )
-            server_logger.info(f'Attempt 2: {rate}')
+            client = ExchangeClientFactory.get_client(exchange_service)
+            rate = await client.fetch_rate(conversion_request.currency_from, conversion_request.currency_to)
             if rate is not None:
-                return await self.make_conversion_response(
-                    conversion_request.exchange, conversion_request.currency_from, conversion_request.currency_to, rate,
+                return await self._prepare_conversion_response(
+                    exchange_service, conversion_request.currency_from, conversion_request.currency_to, rate,
                     conversion_request.amount
                 )
 
-        rate, exchange_service = await self.fetch_rate_by_intermediary_currency(
+        rate, exchange_service = await self._fetch_rate_by_intermediary_currency(
             conversion_request.currency_from, conversion_request.currency_to
         )
         if rate is not None:
-            return await self.make_conversion_response(
+            return await self._prepare_conversion_response(
                 exchange_service, conversion_request.currency_from, conversion_request.currency_to, rate,
                 conversion_request.amount
             )
 
-        raise ConversionNotFound('No exchange services and conversion rates for specified request')
-
-
-
+        raise ConversionNotFound('No exchange services and conversion rates found for specified request')

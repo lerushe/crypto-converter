@@ -1,33 +1,23 @@
 from aiohttp import web
 from pydantic import ValidationError
 
-from services import ConverterService
-from models import ConversionRequest
-from log_setup import server_logger
+from app.models import ConversionRequest
+from app.services import ConversionNotFound, ConverterService
 
 converter_routes = web.RouteTableDef()
 
 
 @converter_routes.post('/api/v1/convert')
 async def convert(request: web.Request):
-    """
-    Endpoint to convert cryptocurrency.
-    """
     data = await request.json()
     try:
         conversion_request = ConversionRequest(**data)
-    except ValidationError as exc:
+        converter_service: ConverterService = request.app['converter_service']
+        res = await converter_service.convert(conversion_request)
+    except (ValidationError, ConversionNotFound) as exc:
         return web.json_response({
             'status': 'error',
             'message': str(exc)
         }, status=400)
 
-    conv_service = ConverterService()
-    res = await conv_service.convert(conversion_request)
-
-    server_logger.info(f'Received conversion request: {res}')
-
-    return web.json_response({
-        'status': 'success',
-        'message': res.model_dump()
-    })
+    return web.json_response(res.model_dump(mode='json'))

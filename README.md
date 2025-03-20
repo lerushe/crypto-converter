@@ -8,6 +8,10 @@ A simple async web application that provides cryptocurrency conversion functiona
 
 ## Development
 
+To run tests:
+
+`python -m pytest tests/`
+
 ### Running with Docker
 
 Build the Docker image:

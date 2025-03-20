@@ -1,7 +1,7 @@
-from enum import Enum
 from decimal import Decimal
+from enum import Enum
 
-from pydantic import BaseModel
+from pydantic import BaseModel, field_serializer
 
 
 class ExchangeService(str, Enum):
@@ -24,3 +24,7 @@ class ConversionResponse(BaseModel):
     rate: Decimal
     result: Decimal
     updated_at: int
+
+    @field_serializer('rate', 'result')
+    def serialize_decimal(self, value: Decimal, _info):
+        return f'{value:.2f}'
