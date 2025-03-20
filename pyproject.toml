@@ -1,0 +1,18 @@
+[tool.poetry]
+name = "crypto-converter"
+version = "0.1.0"
+description = "Cryptocurrency conversion"
+authors = ["Valeriia Shestakova <valeriiashestakova@gmail.com>"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.10"
+aiohttp = "^3.11.14"
+pydantic = "^2.10.6"
+redis = "^5.2.1"
+uvloop = "^0.21.0"
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
