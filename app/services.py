@@ -51,13 +51,15 @@ class ConverterService:
             currency_from=conversion_request.currency_from, currency_to=conversion_request.currency_to
         )
         cached_data = await self.redis_client.hgetall(cache_key)
-        if cached_data:
-            current_time = int(time.time())
-            cache_updated_at = int(cached_data['updated_at'])
-            if current_time - cache_updated_at > conversion_request.cache_max_seconds:
-                return None, None, None
-            server_logger.info(f'Using cached conversion rate: {cached_data}')
-            return Decimal(cached_data['rate']), cached_data['exchange_service'], cache_updated_at
+        if not cached_data:
+            return None, None, None
+
+        current_time = int(time.time())
+        cache_updated_at = int(cached_data['updated_at'])
+        if current_time - cache_updated_at > conversion_request.cache_max_seconds:
+            return None, None, None
+        server_logger.info(f'Using cached conversion rate: {cached_data}')
+        return Decimal(cached_data['rate']), cached_data['exchange_service'], cache_updated_at
 
     async def _save_cache_rate(
         self, exchange_service: ExchangeService, currency_from: str, currency_to: str, rate: Decimal, updated_at: int
