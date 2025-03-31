@@ -2,8 +2,7 @@ import asyncio
 import time
 from decimal import Decimal
 
-import redis.asyncio as redis
-
+from app.cache import RateCache
 from app.clients.factory import ExchangeClientFactory
 from app.log_setup import server_logger
 from app.models import ConversionRequest, ConversionResponse, ExchangeService
@@ -15,10 +14,9 @@ class ConversionNotFound(Exception):
 
 class ConverterService:
 
-    def __init__(self, redis_client: redis.Redis, redis_timeout: int, intermediary_currencies: list[str]):
-        self.redis_client = redis_client
+    def __init__(self, cache_client: RateCache, intermediary_currencies: list[str]):
+        self.cache_client = cache_client
         self.intermediary_currencies = intermediary_currencies
-        self.redis_default_timeout = redis_timeout
         self.available_conversion_services = ExchangeClientFactory.mapping
         self.cache_key_template = 'conversion:{currency_from}:{currency_to}'
 
@@ -44,42 +42,13 @@ class ConverterService:
 
         return None, None
 
-    async def _get_cache_rate(
-        self, conversion_request: ConversionRequest
-    ) -> tuple[Decimal | None, ExchangeService | None, int | None]:
-        cache_key = self.cache_key_template.format(
-            currency_from=conversion_request.currency_from, currency_to=conversion_request.currency_to
-        )
-        cached_data = await self.redis_client.hgetall(cache_key)
-        if not cached_data:
-            return None, None, None
-
-        current_time = int(time.time())
-        cache_updated_at = int(cached_data['updated_at'])
-        if current_time - cache_updated_at > conversion_request.cache_max_seconds:
-            return None, None, None
-        server_logger.info(f'Using cached conversion rate: {cached_data}')
-        return Decimal(cached_data['rate']), cached_data['exchange_service'], cache_updated_at
-
-    async def _save_cache_rate(
-        self, exchange_service: ExchangeService, currency_from: str, currency_to: str, rate: Decimal, updated_at: int
-    ) -> None:
-        cache_key = self.cache_key_template.format(currency_from=currency_from, currency_to=currency_to)
-        await self.redis_client.hset(cache_key, mapping={
-            'rate': str(rate),
-            'updated_at': updated_at,
-            'exchange_service': exchange_service
-        })
-        # Add expire timeout just to not have too old data
-        await self.redis_client.expire(cache_key, self.redis_default_timeout)
-
     async def _prepare_conversion_response(
-        self, exchange_service: ExchangeService, currency_from: str, currency_to: str, rate: Decimal,
-        amount: Decimal, *, cache_updated_at: int | None = None
+        self, exchange_service: ExchangeService, currency_from: str, currency_to: str, rate: Decimal, amount: Decimal,
+        *, cache_updated_at: int | None = None
     ) -> ConversionResponse:
         updated_at = int(time.time())
         if cache_updated_at is None:
-            await self._save_cache_rate(exchange_service, currency_from, currency_to, rate, updated_at)
+            await self.cache_client.save_cache_rate(exchange_service, currency_from, currency_to, rate, updated_at)
 
         return ConversionResponse(
             currency_from=currency_from,
@@ -92,8 +61,11 @@ class ConverterService:
 
     async def convert(self, conversion_request: ConversionRequest) -> ConversionResponse:
         if conversion_request.cache_max_seconds is not None:
-            rate, exchange_service, updated_at = await self._get_cache_rate(conversion_request)
+            rate, exchange_service, updated_at = await self.cache_client.load_cache_rate(
+                conversion_request.currency_from, conversion_request.currency_to, conversion_request.cache_max_seconds
+            )
             if rate is not None:
+                server_logger.info(f'Using cached conversion rate: {rate}')
                 return await self._prepare_conversion_response(
                     exchange_service, conversion_request.currency_from, conversion_request.currency_to, rate,
                     conversion_request.amount, cache_updated_at=updated_at

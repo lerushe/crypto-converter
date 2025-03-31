@@ -2,6 +2,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from app.cache import RateCache
 from app.services import ConverterService
 
 
@@ -12,11 +13,15 @@ def redis_mock():
 
 
 @pytest.fixture
-def converter_service(redis_mock):
+def cache_mock(redis_mock):
+    return RateCache(redis_client = redis_mock, redis_timeout = 3600)
+
+
+@pytest.fixture
+def converter_service(cache_mock):
     with patch('app.clients.factory.ExchangeClientFactory.get_client') as get_client_mock:
         service = ConverterService(
-            redis_client=redis_mock,
-            redis_timeout=3600,
+            cache_client=cache_mock,
             intermediary_currencies=['USDT', 'BTC', 'ETH']
         )
         yield service, get_client_mock
